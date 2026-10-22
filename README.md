@@ -26,11 +26,11 @@
 не пойдёт дальше, если файл отличается от опубликованного:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.0/collect.sh \
-  && echo "0c959c20f252d342b0ade48242dbf97b25bda695013ec2dc971bf646eadf3458  collect.sh" | sha256sum -c
+curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.1/collect.sh \
+  && echo "cfef56aecf9fcda79639e7009c5a685d1c2ecd63b774d84d2bc91427ebbd1d7e  collect.sh" | sha256sum -c
 ```
 
-Или через git: `git clone --branch v4.0 https://github.com/Svyatoslav-r/inventory`.
+Или через git: `git clone --branch v4.1 https://github.com/Svyatoslav-r/inventory`.
 
 ## Запуск
 
@@ -97,6 +97,7 @@ curl его не видно. С `--push` JSON в stdout не выводится 
 | `default` | только у `php`: этот PHP вызывается командой `php` |
 | `raw` | первая строка вывода команды версии как есть, на случай если `version` разобран неверно |
 | `candidate` | версия пакета, которую поставил бы `apt upgrade` / `yum update`. Совпадает с `package_version` — обновлений нет |
+| `source` | только dpkg: пакет-исходник и его версия, `{"name": "php8.3", "version": "8.3.6-0ubuntu0.24.04.12"}`. По ним ищут уязвимости базы OSV и трекеры Debian/Ubuntu: `php8.3-cli` собран из `php8.3`, `redis-server` — из `redis` |
 | `repos` | откуда придёт эта версия: `origin` — поле Origin из Release-файла репозитория apt (`Debian`, `Ubuntu`, `Freexian` — Debian ELTS, `deb.sury.org`, `nginx`, `Docker`, `MySQL`, `Zabbix`…), `suite` — дистрибутив (`bullseye-security`, `noble-updates`) или id репозитория yum/dnf (`baseos`, `epel`, `remi-safe`), `url` — адрес репозитория apt. `[]` — пакета нет ни в одном подключённом репозитории |
 
 `candidate` и `repos` есть только у программ из пакетов и только когда на сервере есть
