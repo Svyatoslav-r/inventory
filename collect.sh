@@ -13,6 +13,8 @@
 #   ssh root@host 'bash -s -- -n test' < collect.sh > test.json
 # Отправить отчёт на сервер учёта (адрес и токен выдаёт он, см. README):
 #   ./collect.sh -n test --push https://example.com/api/inventory/reports --token ТОКЕН
+# Если на сервере Docker — ещё и отчёты работающих контейнеров (каждый — сервер «test@имя»):
+#   ./collect.sh -n test --containers --push https://example.com/api/inventory/reports --token ТОКЕН
 #
 # Совместим с bash 4.2 (CentOS 7 / BitrixVM), Debian/Ubuntu и RHEL-семейством.
 
@@ -27,6 +29,9 @@ PUSH_URL=""
 TOKEN_FILE=""
 TOKEN=""
 TMP_REPORT=""
+CONTAINERS=false
+CONTAINER=""        # внутри контейнера: его имя и образ (передаёт запуск с --containers)
+CONTAINER_IMAGE=""
 PKG=""
 SYSTEMD=false
 ITEMS=()
@@ -36,13 +41,16 @@ declare -A SEEN FOUND PKG_VERSION PKG_CANDIDATE PKG_REPOS PKG_SOURCE
 
 usage() {
     cat <<'EOF'
-Использование: collect.sh [-o ФАЙЛ] [-n ИМЯ] [--push URL --token ТОКЕН]
+Использование: collect.sh [-o ФАЙЛ] [-n ИМЯ] [--containers] [--push URL --token ТОКЕН]
 
   -o, --out ФАЙЛ         записать JSON в файл (по умолчанию — в stdout)
   -n, --name ИМЯ         имя сервера в поле "host" (по умолчанию hostname)
       --push URL         отправить отчёт POST-запросом на этот адрес
       --token ТОКЕН      токен сервера для --push (заголовок Authorization: Bearer)
       --token-file ФАЙЛ  то же, но токен из файла; ещё можно переменной INVENTORY_TOKEN
+      --containers       ещё и отчёты работающих Docker-контейнеров: этот же скрипт
+                         запускается в каждом через docker exec (нужен bash в контейнере).
+                         Имя в отчёте — ИМЯ@контейнер; с -o ФАЙЛ — файлы ФАЙЛ@контейнер.json
   -h, --help             эта справка
 EOF
 }
@@ -575,6 +583,61 @@ push_report() {
     esac
 }
 
+# --- Контейнеры Docker ---
+
+# Можно ли собрать контейнеры — до сбора по самому серверу
+check_containers() {
+    have docker || die "--containers: не найден docker"
+    # В контейнер передаётся этот же файл; при «bash -s < collect.sh» файла нет
+    [[ -f ${BASH_SOURCE[0]} && -r ${BASH_SOURCE[0]} ]] || die "--containers: запускайте collect.sh из файла, а не через bash -s"
+    [[ -n $OUTFILE || -n $PUSH_URL ]] || die "--containers: отчётов будет несколько — нужен -o ФАЙЛ или --push"
+    [[ $NAME != *@* ]] || die "--containers: в имени сервера не должно быть @"
+    timeout -k 2 "$CMD_TIMEOUT" docker ps -q </dev/null >/dev/null 2>&1 ||
+        die "--containers: docker ps не ответил — запущен ли Docker и хватает ли прав (sudo)?"
+}
+
+# Этот же скрипт — в каждом работающем контейнере, от root внутри контейнера, с теми же
+# правилами: только читает. Отчёт каждого контейнера — отдельно, имя «сервер@контейнер».
+# Без bash (образы на Alpine, distroless) контейнер пропускается.
+collect_containers() {
+    local list name image report file failed=0
+    list=$(timeout -k 2 "$CMD_TIMEOUT" docker ps --format '{{.Names}}\t{{.Image}}' </dev/null) ||
+        die "--containers: docker ps не ответил — запущен ли Docker и хватает ли прав (sudo)?"
+    [[ -n $list ]] || { log "Работающих контейнеров нет"; return 0; }
+
+    while IFS=$'\t' read -r name image; do
+        [[ -n $name ]] || continue
+        if ! timeout -k 2 "$CMD_TIMEOUT" docker exec -u 0 "$name" sh -c 'command -v bash && command -v timeout' </dev/null >/dev/null 2>&1; then
+            log "Контейнер $name ($image): нет bash — пропущен"
+            continue
+        fi
+
+        report=$(mktemp) || die "не удалось создать временный файл"
+        log "Контейнер $name ($image)…"
+        if ! timeout -k 5 600 docker exec -i -u 0 "$name" bash -s -- -n "$NAME@$name" \
+                --container "$name" --container-image "$image" <"${BASH_SOURCE[0]}" >"$report" ||
+            [[ $(head -c1 "$report") != '{' ]]; then
+            log "Контейнер $name: отчёт не собрался"
+            rm -f "$report"
+            failed=1
+            continue
+        fi
+
+        file=$report
+        if [[ -n $OUTFILE ]]; then
+            file="${OUTFILE%.json}@$name.json"
+            mv -f "$report" "$file" || die "не удалось записать $file"
+            log "Готово: $file"
+        fi
+        if [[ -n $PUSH_URL ]]; then
+            push_report "$file"
+        fi
+        [[ $file == "$report" ]] && rm -f "$report"
+    done <<<"$list"
+
+    (( failed == 0 )) || die "отчёты собрались не со всех контейнеров"
+}
+
 os_json() {
     local id="" version_id="" name=""
     if [[ -f /etc/os-release ]]; then
@@ -601,6 +664,9 @@ render() {
     printf '  "os": %s,\n' "$(os_json)"
     printf '  "package_manager": %s,\n' "$(json_str "$PKG")"
     printf '  "systemd": %s,\n' "$SYSTEMD"
+    if [[ -n $CONTAINER ]]; then
+        printf '  "container": {"name": %s, "image": %s},\n' "$(json_str "$CONTAINER")" "$(json_str "$CONTAINER_IMAGE")"
+    fi
     printf '  "package_lists_updated_at": %s,\n' "$(json_str "$LISTS_UPDATED_AT")"
     printf '  "software": [\n'
     for i in "${!ITEMS[@]}"; do
@@ -621,6 +687,10 @@ main() {
             --push) PUSH_URL=$2; shift 2 ;;
             --token) TOKEN=$2; shift 2 ;;
             --token-file) TOKEN_FILE=$2; shift 2 ;;
+            --containers) CONTAINERS=true; shift ;;
+            # Служебные: их передаёт запуск с --containers скрипту внутри контейнера
+            --container) CONTAINER=$2; shift 2 ;;
+            --container-image) CONTAINER_IMAGE=$2; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) usage >&2; die "неизвестный параметр: $1" ;;
         esac
@@ -639,6 +709,7 @@ main() {
     [[ -d /run/systemd/system ]] && SYSTEMD=true
     # Без токена отправить не получится — понять это до сбора, а не после
     [[ -n $PUSH_URL ]] && read_token
+    $CONTAINERS && check_containers
     (( EUID == 0 )) || log "Внимание: запуск не от root — состояние служб может быть неполным"
 
     log "Сбор версий ПО на $NAME…"
@@ -660,6 +731,10 @@ main() {
             render >"$TMP_REPORT" || die "не удалось записать отчёт"
         fi
         push_report "${OUTFILE:-$TMP_REPORT}"
+    fi
+
+    if $CONTAINERS; then
+        collect_containers
     fi
 }
 
