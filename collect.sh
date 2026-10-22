@@ -32,7 +32,7 @@ SYSTEMD=false
 ITEMS=()
 ITEM_PKGS=()        # пакет каждого элемента ITEMS, по тем же индексам; пусто — не из пакета
 LISTS_UPDATED_AT=""
-declare -A SEEN FOUND PKG_VERSION PKG_CANDIDATE PKG_REPOS
+declare -A SEEN FOUND PKG_VERSION PKG_CANDIDATE PKG_REPOS PKG_SOURCE
 
 usage() {
     cat <<'EOF'
@@ -493,13 +493,20 @@ rpm_updates() {
     done
 }
 
+# Пакет-исходник и его версия. По ним базы уязвимостей (OSV, трекеры Debian и Ubuntu)
+# ищут уязвимости: php8.3-cli собран из php8.3, redis-server — из redis, libc-bin — из glibc
+dpkg_sources() {
+    local bin src ver
+    while IFS=$'\t' read -r bin src ver; do
+        [[ -n $bin && -n $src ]] && PKG_SOURCE[${bin%%:*}]="$src"$'\t'"$ver"
+    done < <(run_pm dpkg-query -W -f='${binary:Package}\t${source:Package}\t${source:Version}\n' "$@")
+}
+
 # Если списков пакетов нет (apt update ни разу не запускался), кандидатов не сообщаем:
 # «обновлений нет» было бы неправдой.
 collect_updates() {
     local p pkgs=()
     local -A uniq
-    LISTS_UPDATED_AT=$(lists_updated_at)
-    [[ -n $LISTS_UPDATED_AT ]] || return 0
 
     for p in "${ITEM_PKGS[@]}"; do
         [[ -n $p && -z ${uniq[$p]} ]] || continue
@@ -507,6 +514,12 @@ collect_updates() {
         pkgs+=("$p")
     done
     (( ${#pkgs[@]} )) || return 0
+
+    # Исходники пакетов от списков пакетов не зависят — их знает сам dpkg
+    [[ $PKG == dpkg ]] && dpkg_sources "${pkgs[@]}"
+
+    LISTS_UPDATED_AT=$(lists_updated_at)
+    [[ -n $LISTS_UPDATED_AT ]] || return 0
 
     case $PKG in
         dpkg) apt_updates "${pkgs[@]}" ;;
@@ -516,9 +529,13 @@ collect_updates() {
 
 # Элемент software[] с полями обновлений, если они известны
 item_json() {
-    local obj=${ITEMS[$1]} p=${ITEM_PKGS[$1]}
+    local obj=${ITEMS[$1]} p=${ITEM_PKGS[$1]} src
     if [[ -n $p && -n ${PKG_REPOS[$p]+x} ]]; then
         obj="${obj%\}}, \"candidate\": $(json_str "${PKG_CANDIDATE[$p]}"), \"repos\": ${PKG_REPOS[$p]}}"
+    fi
+    if [[ -n $p && -n ${PKG_SOURCE[$p]+x} ]]; then
+        src=${PKG_SOURCE[$p]}
+        obj="${obj%\}}, \"source\": {\"name\": $(json_str "${src%%$'\t'*}"), \"version\": $(json_str "${src#*$'\t'}")}}"
     fi
     printf '%s' "$obj"
 }
