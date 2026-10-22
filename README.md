@@ -26,11 +26,11 @@
 не пойдёт дальше, если файл отличается от опубликованного:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.1/collect.sh \
-  && echo "cfef56aecf9fcda79639e7009c5a685d1c2ecd63b774d84d2bc91427ebbd1d7e  collect.sh" | sha256sum -c
+curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.2/collect.sh \
+  && echo "82715219564949342eeb648c7325b097c4776c73ccb637308a0f578f0f7eb44c  collect.sh" | sha256sum -c
 ```
 
-Или через git: `git clone --branch v4.1 https://github.com/Svyatoslav-r/inventory`.
+Или через git: `git clone --branch v4.2 https://github.com/Svyatoslav-r/inventory`.
 
 ## Запуск
 
@@ -53,6 +53,7 @@ ssh root@web-1.example.com 'bash -s -- -n web-1' < collect.sh > web-1.json
 | `-o`, `--out ФАЙЛ` | записать JSON в файл, а не в stdout |
 | `--push URL` | отправить JSON POST-запросом на этот адрес |
 | `--token ТОКЕН` | токен для `--push` (заголовок `Authorization: Bearer`); ещё можно `--token-file ФАЙЛ` или переменной `INVENTORY_TOKEN` |
+| `--containers` | ещё и отчёты работающих Docker-контейнеров (см. ниже); нужен `-o` или `--push` |
 
 ## Отправка на сервер учёта
 
@@ -64,6 +65,27 @@ sudo bash collect.sh -n web-1 --push https://ваш-сервер/api/inventory/r
 curl его не видно. С `--push` JSON в stdout не выводится (с `-o` — ещё и сохраняется в файл),
 в лог пишется ответ сервера или причина отказа. При сбое сети curl повторяет запрос
 до 3 раз.
+
+## Docker-контейнеры
+
+ПО внутри контейнеров с сервера не видно: у контейнера свои пакеты, и обновления системы
+на сервере их не трогают. С `--containers` скрипт после сервера собирает и каждый работающий
+контейнер:
+
+```bash
+sudo bash collect.sh -n web-1 --containers --push https://ваш-сервер/api/inventory/reports --token ТОКЕН
+sudo bash collect.sh -n web-1 --containers -o web-1.json   # web-1.json, web-1@app.json, web-1@db.json…
+```
+
+- В контейнер передаётся этот же файл (`docker exec -i -u 0 … bash -s`) и работает по тем же
+  правилам: только читает. Поэтому запускать нужно из файла, а не через `bash -s < collect.sh`.
+- Отчёт контейнера — отдельный, с именем `сервер@контейнер` (`web-1@app`) и полем `container`.
+  Токен сервера подходит и для его контейнеров.
+- Нужны `bash` и `timeout` внутри контейнера. Образы на Alpine и distroless пропускаются
+  с сообщением в лог.
+- Списков пакетов в образах обычно нет (их удаляют при сборке), поэтому доступные
+  обновления у контейнера не видны — только версии пакетов. Пакеты в контейнере
+  обновляются пересборкой образа.
 
 ## Что в JSON
 
@@ -84,6 +106,9 @@ curl его не видно. С `--push` JSON в stdout не выводится 
   ]
 }
 ```
+
+У отчёта контейнера (`--containers`) на верхнем уровне есть ещё
+`"container": {"name": "app", "image": "hotapi-app"}` — имя контейнера и его образ.
 
 Каждый элемент `software` — одна установленная программа:
 
