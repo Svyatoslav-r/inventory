@@ -26,11 +26,11 @@
 не пойдёт дальше, если файл отличается от опубликованного:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.0/collect.sh \
-  && echo "0c959c20f252d342b0ade48242dbf97b25bda695013ec2dc971bf646eadf3458  collect.sh" | sha256sum -c
+curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.1/collect.sh \
+  && echo "cfef56aecf9fcda79639e7009c5a685d1c2ecd63b774d84d2bc91427ebbd1d7e  collect.sh" | sha256sum -c
 ```
 
-Или через git: `git clone --branch v4.0 https://github.com/Svyatoslav-r/inventory`.
+Или через git: `git clone --branch v4.1 https://github.com/Svyatoslav-r/inventory`.
 
 ## Запуск
 
