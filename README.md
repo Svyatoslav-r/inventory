@@ -26,11 +26,11 @@
 не пойдёт дальше, если файл отличается от опубликованного:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.2/collect.sh \
-  && echo "82715219564949342eeb648c7325b097c4776c73ccb637308a0f578f0f7eb44c  collect.sh" | sha256sum -c
+curl -fsSLO https://raw.githubusercontent.com/Svyatoslav-r/inventory/v4.3/collect.sh \
+  && echo "4ecc08c6df81dacc04bd1842e7f8d969f202f55fd98d06c33a5cfb10bad2a65e  collect.sh" | sha256sum -c
 ```
 
-Или через git: `git clone --branch v4.2 https://github.com/Svyatoslav-r/inventory`.
+Или через git: `git clone --branch v4.3 https://github.com/Svyatoslav-r/inventory`.
 
 ## Запуск
 
@@ -64,7 +64,8 @@ sudo bash collect.sh -n web-1 --push https://ваш-сервер/api/inventory/r
 Адрес и токен выдаёт сервер учёта. Токен передаётся curl через stdin, поэтому в аргументах
 curl его не видно. С `--push` JSON в stdout не выводится (с `-o` — ещё и сохраняется в файл),
 в лог пишется ответ сервера или причина отказа. При сбое сети curl повторяет запрос
-до 3 раз.
+до 3 раз. Если отчёт не принят, скрипт завершается с кодом 1; с `--containers` отказ по
+одному отчёту не мешает отправить остальные.
 
 ## Docker-контейнеры
 
@@ -95,12 +96,13 @@ sudo bash collect.sh -n web-1 --containers -o web-1.json   # web-1.json, web-1@a
   "hostname": "srv-test-01",
   "collected_at": "2026-10-21T15:04:50+03:00",
   "collector_version": 4,
+  "collector_release": "4.3",
   "os": {"id": "ubuntu", "version_id": "24.04", "name": "Ubuntu 24.04.5 LTS", "kernel": "6.8.0-45-generic", "arch": "x86_64"},
   "package_manager": "dpkg",
   "systemd": true,
   "package_lists_updated_at": "2026-10-21T06:25:13+03:00",
   "software": [
-    {"id": "nginx", "version": "1.24.0", "path": "/usr/sbin/nginx", "package": "nginx", "package_version": "1.24.0-2ubuntu7.1", "services": [{"unit": "nginx", "active": "active", "enabled": "enabled"}], "raw": "nginx version: nginx/1.24.0 (Ubuntu)", "candidate": "1.24.0-2ubuntu7.5", "repos": [{"origin": "Ubuntu", "suite": "noble-updates", "url": "http://archive.ubuntu.com/ubuntu"}, {"origin": "Ubuntu", "suite": "noble-security", "url": "http://security.ubuntu.com/ubuntu"}]},
+    {"id": "nginx", "version": "1.24.0", "path": "/usr/sbin/nginx", "package": "nginx", "package_version": "1.24.0-2ubuntu7.1", "services": [{"unit": "nginx", "active": "active", "enabled": "enabled"}], "raw": "nginx version: nginx/1.24.0 (Ubuntu)", "candidate": "1.24.0-2ubuntu7.5", "repos": [{"origin": "Ubuntu", "suite": "noble-updates", "url": "http://archive.ubuntu.com/ubuntu", "index_date": "2026-10-21T05:48:11+00:00"}, {"origin": "Ubuntu", "suite": "noble-security", "url": "http://security.ubuntu.com/ubuntu", "index_date": "2026-10-21T04:12:40+00:00"}]},
     {"id": "php", "version": "8.3.6", "path": "/usr/bin/php8.3", "package": "php8.3-cli", "package_version": "8.3.6-0ubuntu0.24.04.12", "services": [], "default": true, "raw": "PHP 8.3.6 (cli) (built: Oct  7 2026 18:06:38) (NTS)"},
     {"id": "redis-server", "version": "7.0.15", "path": "/usr/bin/redis-server", "package": "redis-server", "package_version": "5:7.0.15-1ubuntu0.24.04.5", "services": [], "raw": "Redis server v=7.0.15 ..."}
   ]
@@ -123,13 +125,24 @@ sudo bash collect.sh -n web-1 --containers -o web-1.json   # web-1.json, web-1@a
 | `raw` | первая строка вывода команды версии как есть, на случай если `version` разобран неверно |
 | `candidate` | версия пакета, которую поставил бы `apt upgrade` / `yum update`. Совпадает с `package_version` — обновлений нет |
 | `source` | только dpkg: пакет-исходник и его версия, `{"name": "php8.3", "version": "8.3.6-0ubuntu0.24.04.12"}`. По ним ищут уязвимости базы OSV и трекеры Debian/Ubuntu: `php8.3-cli` собран из `php8.3`, `redis-server` — из `redis` |
-| `repos` | откуда придёт эта версия: `origin` — поле Origin из Release-файла репозитория apt (`Debian`, `Ubuntu`, `Freexian` — Debian ELTS, `deb.sury.org`, `nginx`, `Docker`, `MySQL`, `Zabbix`…), `suite` — дистрибутив (`bullseye-security`, `noble-updates`) или id репозитория yum/dnf (`baseos`, `epel`, `remi-safe`), `url` — адрес репозитория apt. `[]` — пакета нет ни в одном подключённом репозитории |
+| `repos` | откуда придёт эта версия: `origin` — поле Origin из Release-файла репозитория apt (`Debian`, `Ubuntu`, `Freexian` — Debian ELTS, `deb.sury.org`, `nginx`, `Docker`, `MySQL`, `Zabbix`…), `suite` — дистрибутив (`bullseye-security`, `noble-updates`) или id репозитория yum/dnf (`baseos`, `epel`, `remi-safe`), `url` — адрес репозитория apt, `index_date` — когда опубликован индекс этого репозитория, который лежит на сервере (см. ниже). `[]` — пакета нет ни в одном подключённом репозитории |
 
 `candidate` и `repos` есть только у программ из пакетов и только когда на сервере есть
 списки пакетов. Скрипт их не обновляет (`apt update` не запускает, у yum/dnf берёт кеш, `-C`),
 поэтому кандидат настолько свеж, насколько свежи списки: время их последнего обновления —
 в поле `package_lists_updated_at` на верхнем уровне. Если списков нет, это поле `null`,
 а `candidate` и `repos` не выводятся: «обновлений нет» было бы неправдой.
+
+`index_date` — дата самих данных репозитория, а не запуска `apt update`: поле `Date`
+из Release-файла (у yum/dnf — время `repomd.xml` в кеше). Если репозиторий перестал
+обновляться — просрочен ключ, дистрибутив убрали с зеркала, — дата остаётся старой, сколько бы
+раз списки ни обновляли, и совпадение `candidate` с `package_version` для его пакетов уже
+не значит «обновлений нет». Сама по себе старая дата — не ошибка: основной репозиторий
+стабильного выпуска меняется редко, обновления идут через `-security` и `-updates`.
+`package_lists_updated_at` — самая свежая из этих дат по всем репозиториям.
+
+`collector_version` — версия формата JSON (целое число), `collector_release` — выпуск
+скрипта, совпадает с тегом в этом репозитории.
 
 Если на сервере несколько версий PHP, у каждой будет своя запись с `id: "php"`
 (и `php-fpm`, если он установлен).

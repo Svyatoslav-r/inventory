@@ -20,7 +20,11 @@
 
 set -o pipefail
 
+# COLLECTOR_VERSION — версия формата JSON (целое: по нему сервер учёта решает, какие поля ждать),
+# COLLECTOR_RELEASE — выпуск самого скрипта, совпадает с тегом в репозитории.
 readonly COLLECTOR_VERSION=4
+readonly COLLECTOR_RELEASE="4.3"
+readonly APT_LISTS=/var/lib/apt/lists
 readonly CMD_TIMEOUT=20
 
 OUTFILE=""
@@ -58,6 +62,14 @@ EOF
 log() { printf '%s\n' "$*" >&2; }
 die() { log "Ошибка: $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# need_value $# ПАРАМЕТР — у параметра должно быть значение: без проверки «shift 2»
+# при единственном оставшемся аргументе ничего не сдвигает, и разбор зацикливается.
+need_value() { (( $1 >= 2 )) || { usage >&2; die "у параметра $2 нет значения"; }; }
+
+# Временные файлы удаляются при любом выходе, в том числе по ошибке и по сигналу.
+TMP_FILES=()
+cleanup() { (( ${#TMP_FILES[@]} )) && rm -f "${TMP_FILES[@]}"; return 0; }
 
 # Команда с таймаутом, stdout и stderr вместе (многие пишут версию в stderr).
 run() { timeout -k 2 "$CMD_TIMEOUT" "$@" </dev/null 2>&1; }
@@ -382,14 +394,58 @@ collect_software() {
 lists_updated_at() {
     local newest
     case $PKG in
-        dpkg) newest=$(find /var/lib/apt/lists -maxdepth 1 -name '*Release' -printf '%T@\n' 2>/dev/null | sort -n | tail -1) ;;
+        dpkg) newest=$(find "$APT_LISTS" -maxdepth 1 -name '*Release' -printf '%T@\n' 2>/dev/null | sort -n | tail -1) ;;
         rpm) newest=$(find /var/cache/dnf /var/cache/yum -name repomd.xml -printf '%T@\n' 2>/dev/null | sort -n | tail -1) ;;
     esac
-    [[ -n $newest ]] && date -d "@${newest%.*}" -Iseconds
+    iso_time "$newest"
 }
 
+# repo_json ORIGIN SUITE URL ДАТА_ИНДЕКСА
 repo_json() {
-    printf '{"origin": %s, "suite": %s, "url": %s}' "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")"
+    printf '{"origin": %s, "suite": %s, "url": %s, "index_date": %s}' \
+        "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")"
+}
+
+# Время из «секунд с эпохи» (можно с дробной частью) в ISO 8601; пусто → пусто
+iso_time() { [[ -n $1 ]] && date -d "@${1%.*}" -Iseconds 2>/dev/null; }
+
+# Когда опубликован индекс репозитория apt, который лежит на сервере: поле Date его
+# Release-файла, иначе время файла (apt ставит его по Last-Modified с сервера репозитория).
+# Это не время запуска apt update, а возраст самих данных: у репозитория, который перестал
+# обновляться (просрочен ключ, дистрибутив убран с зеркала), дата остаётся старой, сколько
+# бы раз apt update ни запускали — и «обновлений нет» для его пакетов тогда ничего не значит.
+# Аргумент — источник из apt-cache policy: «http://deb.debian.org/debian-security bullseye-security/main amd64».
+apt_index_date() {
+    local url dist base f d
+    read -r url dist _ <<<"$1"
+    base=${url#*://}
+    base=${base%/}
+    base=${base//\//_}
+    # dist — «дистрибутив/компонент», и в дистрибутиве тоже бывает «/» (buster/updates/main):
+    # отбрасываем по части справа, пока не найдётся Release-файл
+    while [[ $dist == */* ]]; do
+        dist=${dist%/*}
+        for f in "$APT_LISTS/${base}_dists_${dist//\//_}_InRelease" "$APT_LISTS/${base}_dists_${dist//\//_}_Release"; do
+            [[ -f $f ]] || continue
+            d=$(sed -n 's/^Date: *//p;T;q' "$f" 2>/dev/null)
+            if [[ -n $d ]] && d=$(date -d "$d" -Iseconds 2>/dev/null); then
+                printf '%s' "$d"
+            else
+                iso_time "$(stat -c %Y "$f" 2>/dev/null)"
+            fi
+            return 0
+        done
+    done
+}
+
+# То же для yum/dnf: время метаданных репозитория (repomd.xml) в кеше.
+# dnf: /var/cache/dnf/ID-хеш/repodata/repomd.xml, yum: /var/cache/yum/…/ID/repomd.xml
+rpm_index_date() {
+    local newest
+    [[ -n $1 ]] || return 0
+    newest=$(find /var/cache/dnf /var/cache/yum \( -path "*/$1-*/repodata/repomd.xml" -o -path "*/$1/repomd.xml" \) \
+        -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+    iso_time "$newest"
 }
 
 # Поле из строки apt-cache policy «release v=24.04,o=Ubuntu,a=noble-security,n=noble,c=main,b=amd64»
@@ -415,7 +471,7 @@ release_suite() {
 # из его Release-файла: Debian, Ubuntu, Freexian (ELTS), deb.sury.org, nginx, MySQL…
 apt_updates() {
     local line src pkg="" cand="" repos="" in_cand=false
-    local -A origin suite
+    local -A origin suite index_date
     local re_src='^ *-?[0-9]+ (.+)$' re_rel='^ +release (.*)$' re_pkg='^([^ ].*):$'
     local re_cand='^ +Candidate: (.+)$' re_ver='^ (\*\*\*|   ) ([^ ]+) -?[0-9]+$'
 
@@ -429,6 +485,7 @@ apt_updates() {
         elif [[ -n $src && $line =~ $re_rel ]]; then
             origin[$src]=$(release_field o "${BASH_REMATCH[1]}")
             suite[$src]=$(release_suite "${BASH_REMATCH[1]}")
+            index_date[$src]=$(apt_index_date "$src")
             src=""
         fi
     done < <(run_pm apt-cache policy)
@@ -445,7 +502,7 @@ apt_updates() {
             [[ -n $cand && ${BASH_REMATCH[2]} == "$cand" ]] && in_cand=true || in_cand=false
         elif $in_cand && [[ $line =~ $re_src && ${BASH_REMATCH[1]} == *" Packages" ]]; then
             src=${BASH_REMATCH[1]% Packages}
-            repos+="${repos:+, }$(repo_json "${origin[$src]}" "${suite[$src]}" "${src%% *}")"
+            repos+="${repos:+, }$(repo_json "${origin[$src]}" "${suite[$src]}" "${src%% *}" "${index_date[$src]}")"
         fi
     done < <(run_pm apt-cache policy "$@")
     apt_store
@@ -461,7 +518,7 @@ apt_store() {
 # yum/dnf: обновления из кеша (-C, без сети) и репозиторий, из которого пакет поставлен.
 # Origin у rpm-репозиториев нет — сообщаем id репозитория: baseos, appstream, epel, remi-safe…
 rpm_updates() {
-    local mgr line name p f=() re_name='^Name +: (.+)$' re_from='^From repo +: (.+)$'
+    local mgr line name p repo f=() re_name='^Name +: (.+)$' re_from='^From repo +: (.+)$'
     local -a w
     local -A upd from
     if have dnf; then mgr=dnf; elif have yum; then mgr=yum; else return 0; fi
@@ -492,12 +549,13 @@ rpm_updates() {
 
     for p in "$@"; do
         if [[ -n ${upd[$p]} ]]; then
+            repo=${upd[$p]##* }
             PKG_CANDIDATE[$p]=${upd[$p]% *}
-            PKG_REPOS[$p]="[$(repo_json "" "${upd[$p]##* }" "")]"
         else
+            repo=${from[$p]}
             PKG_CANDIDATE[$p]=${PKG_VERSION[$p]}
-            PKG_REPOS[$p]="[${from[$p]:+$(repo_json "" "${from[$p]}" "")}]"
         fi
+        PKG_REPOS[$p]="[${repo:+$(repo_json "" "$repo" "" "$(rpm_index_date "$repo")")}]"
     done
 }
 
@@ -562,10 +620,13 @@ read_token() {
 
 # Отправить готовый отчёт. Ответ сервера только печатается: ничего из него не выполняется.
 # Повторять отправку при сбое сети безопасно — сервер сам отличит уже полученный отчёт.
+# Код возврата 1 — отчёт не принят (причина уже в логе): что делать дальше, решает вызывающий,
+# отчёты остальных контейнеров из-за одного отказа пропадать не должны.
 push_report() {
     local file=$1 resp code rc message
     have curl || die "для --push нужен curl"
     resp=$(mktemp) || die "не удалось создать временный файл"
+    TMP_FILES+=("$resp")
     # Токен передаём конфигом curl через stdin, а не аргументом: аргументы видны всем в ps
     code=$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
         curl -sS --config - --max-time 60 --retry 3 --retry-delay 10 \
@@ -575,11 +636,14 @@ push_report() {
     message=$(sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' "$resp")
     rm -f "$resp"
 
-    (( rc == 0 )) || die "не удалось отправить отчёт на $PUSH_URL (curl: код $rc)"
+    if (( rc != 0 )); then
+        log "Ошибка: не удалось отправить отчёт на $PUSH_URL (curl: код $rc)"
+        return 1
+    fi
     case $code in
         2??) log "Отправлено: ${message:-HTTP $code}" ;;
-        401) die "сервер не принял токен (HTTP 401)" ;;
-        *) die "сервер не принял отчёт (HTTP $code): ${message:-без пояснений}" ;;
+        401) log "Ошибка: сервер не принял токен (HTTP 401)"; return 1 ;;
+        *) log "Ошибка: сервер не принял отчёт (HTTP $code): ${message:-без пояснений}"; return 1 ;;
     esac
 }
 
@@ -613,6 +677,7 @@ collect_containers() {
         fi
 
         report=$(mktemp) || die "не удалось создать временный файл"
+        TMP_FILES+=("$report")
         log "Контейнер $name ($image)…"
         if ! timeout -k 5 600 docker exec -i -u 0 "$name" bash -s -- -n "$NAME@$name" \
                 --container "$name" --container-image "$image" <"${BASH_SOURCE[0]}" >"$report" ||
@@ -629,13 +694,14 @@ collect_containers() {
             mv -f "$report" "$file" || die "не удалось записать $file"
             log "Готово: $file"
         fi
-        if [[ -n $PUSH_URL ]]; then
-            push_report "$file"
+        if [[ -n $PUSH_URL ]] && ! push_report "$file"; then
+            log "Контейнер $name: отчёт не отправлен"
+            failed=1
         fi
         [[ $file == "$report" ]] && rm -f "$report"
     done <<<"$list"
 
-    (( failed == 0 )) || die "отчёты собрались не со всех контейнеров"
+    (( failed == 0 )) || die "отчёты собраны или отправлены не со всех контейнеров"
 }
 
 os_json() {
@@ -661,6 +727,7 @@ render() {
     printf '  "hostname": %s,\n' "$(json_str "$(uname -n)")"
     printf '  "collected_at": %s,\n' "$(json_str "$(date -Iseconds)")"
     printf '  "collector_version": %s,\n' "$COLLECTOR_VERSION"
+    printf '  "collector_release": %s,\n' "$(json_str "$COLLECTOR_RELEASE")"
     printf '  "os": %s,\n' "$(os_json)"
     printf '  "package_manager": %s,\n' "$(json_str "$PKG")"
     printf '  "systemd": %s,\n' "$SYSTEMD"
@@ -678,19 +745,21 @@ render() {
 main() {
     # При запуске «ssh … bash -s < collect.sh» скрипт читается из stdin, поэтому
     # main вызывается последней строкой и сразу отключает stdin от команд.
+    local push_failed=false
     exec </dev/null
+    trap cleanup EXIT
 
     while (( $# )); do
         case $1 in
-            -o|--out) OUTFILE=$2; shift 2 ;;
-            -n|--name) NAME=$2; shift 2 ;;
-            --push) PUSH_URL=$2; shift 2 ;;
-            --token) TOKEN=$2; shift 2 ;;
-            --token-file) TOKEN_FILE=$2; shift 2 ;;
+            -o|--out) need_value $# "$1"; OUTFILE=$2; shift 2 ;;
+            -n|--name) need_value $# "$1"; NAME=$2; shift 2 ;;
+            --push) need_value $# "$1"; PUSH_URL=$2; shift 2 ;;
+            --token) need_value $# "$1"; TOKEN=$2; shift 2 ;;
+            --token-file) need_value $# "$1"; TOKEN_FILE=$2; shift 2 ;;
             --containers) CONTAINERS=true; shift ;;
             # Служебные: их передаёт запуск с --containers скрипту внутри контейнера
-            --container) CONTAINER=$2; shift 2 ;;
-            --container-image) CONTAINER_IMAGE=$2; shift 2 ;;
+            --container) need_value $# "$1"; CONTAINER=$2; shift 2 ;;
+            --container-image) need_value $# "$1"; CONTAINER_IMAGE=$2; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) usage >&2; die "неизвестный параметр: $1" ;;
         esac
@@ -727,15 +796,18 @@ main() {
     if [[ -n $PUSH_URL ]]; then
         if [[ -z $OUTFILE ]]; then
             TMP_REPORT=$(mktemp) || die "не удалось создать временный файл"
-            trap 'rm -f "$TMP_REPORT"' EXIT
+            TMP_FILES+=("$TMP_REPORT")
             render >"$TMP_REPORT" || die "не удалось записать отчёт"
         fi
-        push_report "${OUTFILE:-$TMP_REPORT}"
+        push_report "${OUTFILE:-$TMP_REPORT}" || push_failed=true
     fi
 
+    # Контейнеры собираем и после неудачной отправки отчёта сервера: сбой мог быть разовым
     if $CONTAINERS; then
         collect_containers
     fi
+    $push_failed && exit 1
+    return 0
 }
 
 main "$@"
